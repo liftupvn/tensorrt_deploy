@@ -34,13 +34,17 @@ from mmdet.datasets.pipelines import Compose
 from mmcv.parallel import collate, scatter
 from mmdet.core import bbox2result
 from mmdeploy.codebase.mmdet import get_post_processing_params, multiclass_nms
-import tritonclient.grpc as grpcclient
-#import tritonclient.http as httpclient
-
-from tritonclient.utils import InferenceServerException, triton_to_np_dtype
-import tritonclient.utils.shared_memory as shm
 import sys
-
+import numpy as np
+import cv2
+import nanoid
+import os
+from loguru import logger
+import threading
+import sys
+sys.path.append("..")
+from config.rules_base import ruleBase, postProcessMask
+from config import process_config 
 class TensorrtDetector:
     def __init__(self, deploy_cfg_path = "./configs/mmdet/instance-seg/instance-seg_tensorrt-int8_dynamic-320x320-1344x1344.py",
                        model_cfg_path = "../mmdetection/configs/insurance/cascade_mask_rcnn_restnext101.py",
@@ -65,28 +69,8 @@ class TensorrtDetector:
         
         self.damage_class_names = ("Móp, bẹp(thụng)", "Nứt, rạn", 'Vỡ, thủng, rách', "Trầy, xước")
         self.part_class_names = [x for x in self.class_names if x not in self.damage_class_names]
-
-        self.triton_client = grpcclient.InferenceServerClient(
-            url="192.168.81.111:8001",
-            verbose=False,
-            ssl=False
-            #root_certificates=FLAGS.root_certificates,
-            #private_key=FLAGS.private_key,
-            #certificate_chain=FLAGS.certificate_chain
-	)
-        self.model_name = 'yolox'
-        # Health check
-        if not self.triton_client.is_server_live():
-            print("FAILED : is_server_live")
-            sys.exit(1)
-
-        if not self.triton_client.is_server_ready():
-            print("FAILED : is_server_ready")
-            sys.exit(1)
-
-        if not self.triton_client.is_model_ready(self.model_name):
-            print("FAILED : is_model_ready")
-            sys.exit(1)
+        self.cfg = process_config
+        self.post_process_mask = postProcessMask()
 
     @staticmethod
     def get_label_idx(inputLabel):
@@ -147,8 +131,6 @@ class TensorrtDetector:
                         'Ốp hông (vè sau) xe': 'HZc1CUaxDPjbQOmHKNSV0',
                         'Bậc cánh cửa': '6KnkKysGbBW2SiCCj4Whg',
                         'Nẹp ca pô trước': 'HfRM5Yuy3HriODw1iCYh9',
-
-                        #Damage uuid
                         'Móp, bẹp(thụng)': 'zmMJ5xgjmUpqmHd99UNq3',
                         'Nứt, rạn':'5IfgehKG297bQPLkYoZTw',
                         'Vỡ, thủng, rách':'wMxucuruHBUupNOoVy2MF',
@@ -162,17 +144,6 @@ class TensorrtDetector:
     def __clear_outputs(
         test_outputs: List[Union[torch.Tensor, np.ndarray]]
     ) -> List[Union[List[torch.Tensor], List[np.ndarray]]]:
-        """Removes additional outputs and detections with zero and negative
-        score.
-
-        Args:
-            test_outputs (List[Union[torch.Tensor, np.ndarray]]):
-                outputs of forward_test.
-
-        Returns:
-            List[Union[List[torch.Tensor], List[np.ndarray]]]:
-                outputs with without zero score object.
-        """
         batch_size = len(test_outputs[0])
 
         num_outputs = len(test_outputs)
@@ -190,26 +161,23 @@ class TensorrtDetector:
         is_batch = False
         cfg = self.model_cfg
         device = torch.device("cuda:0")
-
         if isinstance(imgs[0], np.ndarray):
             cfg = cfg.copy()
             # set loading pipeline type
             cfg.data.test.pipeline[0].type = 'LoadImageFromWebcam'
+
+
         cfg.data.test.pipeline = replace_ImageToTensor(cfg.data.test.pipeline)
         test_pipeline = Compose(cfg.data.test.pipeline)
-        print(cfg.data.test.pipeline)
         datas = []
         for img in imgs:
-            # prepare data
             if isinstance(img, np.ndarray):
-                # directly add img
                 data = dict(img=img)
             else:
-                # add information into dict
                 data = dict(img_info=dict(filename=img), img_prefix=None)
-            # build the data pipeline
             data = test_pipeline(data)
             datas.append(data)
+
         data = collate(datas, samples_per_gpu=len(imgs))
         data['img_metas'] = [img_metas.data[0] for img_metas in data['img_metas']]
         data['img'] = [img.data[0] for img in data['img']]
@@ -225,7 +193,6 @@ class TensorrtDetector:
         img_metas = img_metas[0]
         results = []
         rescale = True
-
         for i in range(batch_size):
             dets, labels = batch_dets[i], batch_labels[i]
             if rescale:
@@ -233,17 +200,11 @@ class TensorrtDetector:
 
                 if isinstance(scale_factor, (list, tuple, np.ndarray)):
                     assert len(scale_factor) == 4
-                    scale_factor = np.array(scale_factor)[None, :]
-  # [1,4]  
-                # import pdb; pdb.set_trace()
-                # scale_factor = torch.from_numpy(scale_factor).to(dets)
-                scale_factor = torch.from_numpy(scale_factor)
+                    scale_factor = np.array(scale_factor)[None, :]  # [1,4]
+                scale_factor = torch.from_numpy(scale_factor).to(dets)
                 dets[:, :4] /= scale_factor
 
             if 'border' in img_metas[i]:
-                # offset pixel of the top-left corners between original image
-                # and padded/enlarged image, 'border' is used when exporting
-                # CornerNet and CentripetalNet to onnx
                 x_off = img_metas[i]['border'][2]
                 y_off = img_metas[i]['border'][0]
                 dets[:, [0, 2]] -= x_off
@@ -269,15 +230,6 @@ class TensorrtDetector:
                         dets[:, :4], masks, ori_w, ori_h, self.model.device)
                 else:
                     masks = masks[:, :img_h, :img_w]
-                # avoid to resize masks with zero dim
-                # if rescale and masks.shape[0] != 0:
-                #     masks = torch.nn.functional.interpolate(
-                #         masks.unsqueeze(0), size=(ori_h, ori_w))
-                #     masks = masks.squeeze(0)
-                # if masks.dtype != bool:
-                #     masks = masks >= 0.5
-                # aligned with mmdet to easily convert to numpy
-                # masks = masks.cpu()
                 segms_results = [[] for _ in range(len(self.model.CLASSES))]
                 for j in range(len(dets)):
                     segms_results[labels[j]].append(masks[j][0][0])
@@ -287,26 +239,14 @@ class TensorrtDetector:
             return results
 
     def predict(self, data):
-        inputs = []
-        outputs = []
-        inputs.append(grpcclient.InferInput('input', [1, 3, 588, 800], "FP32"))
-        outputs.append(grpcclient.InferRequestedOutput('masks'))
-        outputs.append(grpcclient.InferRequestedOutput('dets'))
-        outputs.append(grpcclient.InferRequestedOutput('labels'))
         input_img = data['img'][0].contiguous()
         img_metas = data['img_metas']
-        input_img = input_img.detach().cpu().numpy()
-        inputs[0].set_data_from_numpy(input_img)
-        output = self.triton_client.infer(model_name=self.model_name,
-                                    inputs=inputs,
-                                    outputs=outputs,
-                                    client_timeout=1)
-        outputs = [output.as_numpy('dets'), output.as_numpy('labels'), output.as_numpy('masks')]
-
-        # outputs = output.as_numpy('masks')
+        outputs = self.model.forward_test(input_img, img_metas, return_loss=False, rescale=True)
         outputs = TensorrtDetector.__clear_outputs(outputs)
         return outputs
-    def __call__(self, img, type_mask = "cpu"):
+    
+    def __call__(self, img, type_mask = "gpu"):
+        im_h, im_w, chanel = img.shape
         data = self.preprocess(img)
         outputs = self.predict(data)
         result = self.post_processing1(data, outputs)[0]
@@ -320,23 +260,164 @@ class TensorrtDetector:
                 for i in range(len(result[0][c])):
                     roi = np.array(result[0][c][i])[:4]
                     score = result[0][c][i][-1]
-                    # mask = np.array(result[1][c][i]).astype(np.int)
                     mask = result[1][c][i].int()[None, ...]
-                    roi = np.array(roi).astype(np.int)
-
-                    # list_result.append([mask, roi, c, score])
+                    roi = np.array(roi).astype(np.int8)
                     classes.append(c)
                     scores.append(score)
                     boxes.append(roi)
                     masks.append(mask)
+                    
         masks = torch.cat(masks, dim = 0)
-        if type_mask == "cpu":
-            masks = masks.detach().cpu().numpy()
-        return classes, scores, boxes, masks
+        logger.info(f'FINISH SEGMENTATION! {masks.shape[0]} ANNOTATIONS WERE FOUND')
+        scores= torch.from_numpy(np.array(scores)).cuda()
+        boxes = torch.from_numpy(np.array(boxes)).cuda()
+        
+        segment_results = []
+        def damage_masks_post_process():
+            # save the damage masks
+            index_score_damage = torch.where(scores > 0.3)[0]
+            for class_name in self.damage_class_names:
+                class_id = self.class_names.index(class_name)
+                index_damage = np.where(np.array(classes) == class_id)[0]
+                index_damage = [x for x in index_damage if x in index_score_damage]
+                index_damage = torch.from_numpy(np.array(index_damage)).cuda()
+                if len(index_damage) != 0:
+                    mask_damage = torch.index_select(masks, 0, index_damage)
+                    mask_damage = torch.sum(mask_damage, axis = 0)
+                    mask_damage = (mask_damage > 0).int().cpu().numpy()
+                    
+                    # mask_img_path, mask_img_name = _save_mask( self.mask_tmp_dir, mask_damage,\
+                    #     [0, 0, im_w, im_h], im_w, im_h)
+                    segment_results.append({
+                        'class_id': class_id,
+                        'score': 1.0,
+                        'box': [0.0, 0.0, 1.0, 1.0],
+                        'box_abs': [0, 0, im_w, im_h],
+                        'mask': mask_damage,
+                        'is_part': 0
+                    })
+                else:
+                    logger.info(f'Damage class {class_name} have no mask!')
 
+            logger.info('FINISH MERGE CAR DAMAGE!')
+
+        
+        logger.info('START POSTPROCESS CAR DAMAGE!')
+        y = threading.Thread(target=damage_masks_post_process)
+        y.start()
+
+        logger.info('START POSTPROCESS CAR PARTS!')
+        index_item_part = []
+        index_item_key_part = []
+        index_key_part = []
+        index_normal_part = []
+
+        for i in range(len(scores)):
+            class_name = self.class_names[classes[i]]
+            if (scores[i] > 0.7) and (class_name in self.part_class_names):
+                if (class_name in self.post_process_mask.listParts) and (class_name in self.post_process_mask.splitParts.keys()):
+                    index_item_key_part.append(i)
+                else:
+                    if (class_name in self.post_process_mask.listParts):
+                        index_item_part.append(i)
+            
+                    if (class_name in self.post_process_mask.splitParts.keys()):
+                        index_key_part.append(i)
+                    else:
+                        index_normal_part.append(i) 
+                                    
+        index_item_key_part = torch.from_numpy(np.array(index_item_key_part)).cuda()
+        index_item_part = torch.from_numpy(np.array(index_item_part)).cuda()
+        index_key_part = torch.from_numpy(np.array(index_key_part)).cuda()
+        index_normal_part = torch.from_numpy(np.array(index_normal_part)).cuda()
+
+        masks_item_key_part_sum = torch.index_select(masks, 0, index_item_key_part).sum(axis = 0)
+        masks_item_part_sum = torch.index_select(masks, 0, index_item_part).sum(axis = 0)
+
+        masks_item_key_part = torch.index_select(masks, 0, index_item_key_part)
+        masks_item_key_part = (masks_item_key_part - masks_item_part_sum > 0).int()
+
+        masks_key_part = torch.index_select(masks, 0, index_key_part)
+        masks_key_part = (masks_key_part - masks_item_key_part_sum - masks_item_part_sum> 0).int()
+
+        masks_normal_part = torch.index_select(masks, 0, index_normal_part)
+
+        masks_new_ori = torch.cat([masks_item_key_part, masks_key_part, masks_normal_part], dim = 0)
+        new_index = torch.cat([index_item_key_part, index_key_part, index_normal_part]).int()
+        scores_new = torch.index_select(scores, 0, new_index)
+        classes_new = np.array(classes)[new_index.cpu().numpy()]
+        bboxes_new =  torch.index_select(boxes, 0, new_index)
+        masks_identical_all = (masks_new_ori*scores_new[..., None, None]).sum(axis = 0)
+
+        masks_new = masks_new_ori * 2* scores_new[..., None, None] - masks_identical_all
+        masks_new = (masks_new > 0).int()
+        intersection_rate = masks_new.sum(axis = (1, 2))/masks_new_ori.sum(axis = (1, 2))
+
+        def part_post_process(start, stop, step):
+            for i in range(start, stop, step): # len(masks_new)
+                mask = masks_new[i].cpu().numpy().astype(np.uint8)
+                if intersection_rate[i] < 0.2:
+                    continue
+                score = scores_new[i]
+                cls = classes_new[i]
+                class_name = self.class_names[cls]
+                box = bboxes_new[i].cpu().numpy().tolist()
+                x1, y1, x2, y2 = box
+                segment_results.append({
+                                        'class_id': class_name,
+                                        'score': float(score.cpu().numpy()),
+                                        'box': [float(x1/im_w), float(y1/im_h), float(x2/im_w), float(y2/im_h)],
+                                        'box_abs': [int(x1), int(y1), int(x2), int(y2)],
+                                        'mask': mask,
+                                        'is_part': 1
+                                    })
+    
+        range_thead_1 =  int(len(masks_new) / 3)
+        range_thead_2 =  int(len(masks_new) * 2 / 3)
+        x1 = threading.Thread(target=part_post_process, args=(0, range_thead_1, 1))
+        x1.start()
+
+        x2 = threading.Thread(target=part_post_process, args=(range_thead_1, range_thead_2, 1))
+        x2.start()
+
+        x3 = threading.Thread(target=part_post_process, args=(range_thead_2, len(masks_new), 1))
+        x3.start()
+
+        x1.join()
+        x2.join()
+        x3.join()
+        logger.info('FINISH POSTPROCESS CAR PARTS AND DAMAGE!')
+        logger.info(segment_results)
+        y.join()
+        return segment_results
     def plot(self, img):
         data = self.preprocess(img)
         outputs = self.predict(data)
         results = self.post_processing1(data, outputs)
         self.model.show_result(img, results[0], score_thr=0.3)
 
+def _save_mask(temp_dir, binary_mask, box, img_w, img_h):
+    """
+    Save the binary mask to file. The mask will be cropped by "box".
+    binary_mask [512, 512] => The mask will be resized to (img_h, img_w) first.
+    box: absolute box, format x1y1x2y2
+    """
+    temp_mask = np.ones(
+        (binary_mask.shape[0], binary_mask.shape[1], 4), np.uint8)
+    temp_mask *= 255
+    binary_mask = binary_mask.astype(np.uint8)
+    # temp_mask[:, :, 0] *= binary_mask
+    # temp_mask[:, :, 1] *= binary_mask
+    # temp_mask[:, :, 2] *= binary_mask
+    temp_mask[:, :, 3] *= binary_mask
+
+    # resize
+    temp_mask = cv2.resize(temp_mask, (img_w, img_h))
+    # crop
+    temp_mask = temp_mask[int(box[1]):int(box[3]), int(box[0]):int(box[2])]
+    temp_image_name = f"{nanoid.generate()}.png"
+    mask_path = os.path.join(temp_dir, temp_image_name)
+
+    cv2.imwrite(mask_path, temp_mask)
+
+    return temp_image_name

@@ -148,3 +148,4 @@ onnxruntime-linux-x64-1.8.1.tgz.1
 onnxruntime-linux-x64-1.8.1.tgz.2
 onnxruntime-linux-x64-1.8.1/
 model_convert
+dataset/
