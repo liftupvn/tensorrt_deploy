@@ -255,13 +255,11 @@ class TensorrtDetector:
                 # masks = new_masks
                 segms_results = [[] for _ in range(len(self.model.CLASSES))]
                 for j in range(len(dets)):
-                    # segms_results[labels[j]].append(masks[j][0][0])
-                    segms_results[labels[j]].append((masks[j] > 0.5).int()) 
-                import pdb; pdb.set_trace()
+                    segms_results[labels[j]].append(masks[j][0][0])
                 results.append((dets_results, segms_results))
             else:
                 results.append(dets_results)
-        return results
+            return results
 
     def predict(self, data):
         input_img = data['img'][0].contiguous()
@@ -279,8 +277,7 @@ class TensorrtDetector:
         logger.info("tart predict")
         outputs = self.predict(data)
         logger.info("tart post")
-        results = self.post_processing1(data, outputs)
-        
+        result = self.post_processing1(data, outputs)[0]
         # list_result = []
         classes = []
         scores = []

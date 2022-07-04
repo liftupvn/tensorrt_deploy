@@ -1,1 +1,4 @@
 .ipynb_checkpoints/
+*.engine
+INSURANCE_RESULT/
+*.pyc
